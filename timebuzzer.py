@@ -54,6 +54,8 @@ EPIC_BOARD_NAMES = ("Epic", "Epics")
 SPRINT_BACKLOG_BOARD_NAMES = ("Sprint Backlog", "Sprint backlog")
 SPRINTS_BOARD_NAMES = ("Sprints", "Sprint")
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -347,6 +349,35 @@ class TimeBuzzerClient:
                     by_id[tile_id] = tile
         return list(by_id.values())
 
+    def filter_activities(self, filters: Dict[str, Any], offset: int = 0, count: int = 100) -> List[Dict[str, Any]]:
+        data = self.request(
+            "POST",
+            "/activities/filters",
+            params={"offset": str(offset), "count": str(count)},
+            json=filters,
+        )
+        if isinstance(data, dict):
+            for key in ("activities", "data", "items", "results"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    return [item for item in value if isinstance(item, dict)]
+            return [data]
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        return []
+
+    def get_activity(self, activity_id: Any) -> Dict[str, Any]:
+        data = self.request("GET", f"/activities/{activity_id}")
+        if isinstance(data, dict):
+            for key in ("activity", "data", "item", "result"):
+                value = data.get(key)
+                if isinstance(value, dict):
+                    return value
+            return data
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            return data[0]
+        raise RuntimeError(f"Unexpected timeBuzzer activity response: {data!r}")
+
     def create_tile(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         data = self.request("POST", "/tiles", json=payload)
         if isinstance(data, dict):
@@ -442,36 +473,6 @@ def item_epic_refs(item: Dict[str, Any], backlog_meta: Dict[str, Dict[str, Any]]
     return extract_relation_refs(item, backlog_meta, "epic")
 
 
-def sprint_sort_value(item: Dict[str, Any], meta: Dict[str, Dict[str, Any]], index: int) -> Tuple[int, datetime, int]:
-    active = 0
-    best_date = parse_date(item.get("updated_at")) or datetime.min
-
-    for column_value in item.get("column_values", []) or []:
-        title = column_title(meta, column_value).lower()
-        column_id = str(column_value.get("id") or "").lower()
-        label = f"{column_id} {title}"
-        value = parse_json_object(column_value.get("value"))
-        text = column_display_value(column_value).lower()
-
-        if ("active" in label or "current" in label) and (
-            value.get("checked") is True or text in {"true", "yes", "checked"}
-        ):
-            active = 1
-
-        column_type = column_value.get("type")
-        if column_type == "timeline":
-            candidate = parse_date(value.get("to") or value.get("from") or column_value.get("text"))
-        elif column_type == "date":
-            candidate = parse_date(value.get("date") or column_value.get("text"))
-        else:
-            candidate = None
-
-        if candidate and candidate > best_date:
-            best_date = candidate
-
-    return active, best_date, -index
-
-
 def latest_sprint_keys(
     sprint_board: Optional[Dict[str, Any]],
     sprint_items: List[Dict[str, Any]],
@@ -480,23 +481,15 @@ def latest_sprint_keys(
     count: int,
 ) -> List[str]:
     if sprint_board and sprint_items:
-        sprint_meta = column_meta_by_id(sprint_board)
-        ordered = sorted(
-            enumerate(sprint_items),
-            key=lambda pair: sprint_sort_value(pair[1], sprint_meta, pair[0]),
-            reverse=True,
-        )
         keys: List[str] = []
-        for _, sprint in ordered:
+        for sprint in sprint_items[:count]:
             sprint_id = sprint.get("id")
             if sprint_id:
                 keys.append(f"id:{sprint_id}")
             normalized = normalize_name(sprint.get("name"))
             if normalized:
                 keys.append(f"name:{normalized}")
-            if len({key for key in keys if key.startswith("id:")}) >= count:
-                break
-        return keys[: count * 2]
+        return keys
 
     refs_by_key: Dict[str, Tuple[datetime, str]] = {}
     for item in backlog_items:
@@ -524,24 +517,9 @@ def filter_items_by_sprints(
 
 
 def parse_layer_ids(explicit: Optional[str] = None, existing_tiles: Optional[List[Dict[str, Any]]] = None) -> LayerIds:
-    raw = explicit or os.environ.get("TIMEBUZZER_LAYER_IDS")
     
-    if raw:
-        parts = [part.strip() for part in raw.split(",") if part.strip()]
-        if len(parts) != 3:
-            raise RuntimeError("TIMEBUZZER_LAYER_IDS must contain exactly three comma-separated IDs.")
-        return LayerIds(epic=int(parts[0]), item=int(parts[1]), subitem=int(parts[2]))
-    named = (
-        os.environ.get("TIMEBUZZER_EPIC_LAYER_ID"),
-        os.environ.get("TIMEBUZZER_ITEM_LAYER_ID"),
-        os.environ.get("TIMEBUZZER_SUBITEM_LAYER_ID"),
-    )
-    if all(named):
-        return LayerIds(epic=int(named[0]), item=int(named[1]), subitem=int(named[2]))
-
     inferred = infer_layer_ids_from_existing_tiles(existing_tiles or [])
     if inferred:
-        print(inferred)
         return inferred
 
     raise RuntimeError(
@@ -715,40 +693,22 @@ def ensure_tile(
     custom_data = str(payload.get("customData") or "")
     existing = existing_by_custom_data.get(custom_data)
     if existing:
-        duplicate_candidates = [
-            tile
-            for tile in existing_by_name_layer.get(tile_name_layer_key(payload), [])
-            if str(tile.get("id")) != str(existing.get("id"))
-        ]
-        archive_duplicate_tiles(client, duplicate_candidates, execute, archived_duplicates, kind, board, monday_item, progress)
-        existing_by_name_layer[tile_name_layer_key(payload)] = [existing]
         if tile_needs_update(existing, payload):
             tile = update_existing_tile(client, existing, payload, execute, updated, kind, board, monday_item, progress)
             existing_by_custom_data[custom_data] = tile
-            existing_by_name_layer[tile_name_layer_key(payload)] = [tile]
             return tile
         skipped.append(existing)
-        print_progress("skip_existing", kind, payload, board, monday_item, existing, progress=progress)
+        # print_progress("skip_existing", kind, payload, board, monday_item, existing, progress=progress)
         return existing
-
-    name_matches = existing_by_name_layer.get(tile_name_layer_key(payload), [])
-    canonical = choose_canonical_tile(name_matches, custom_data)
-    if canonical:
-        duplicate_candidates = [tile for tile in name_matches if str(tile.get("id")) != str(canonical.get("id"))]
-        archive_duplicate_tiles(client, duplicate_candidates, execute, archived_duplicates, kind, board, monday_item, progress)
-        tile = update_existing_tile(client, canonical, payload, execute, updated, kind, board, monday_item, progress)
-        existing_by_custom_data[custom_data] = tile
-        existing_by_name_layer[tile_name_layer_key(payload)] = [tile]
-        return tile
 
     if not execute:
         preview = dict(payload)
         preview["id"] = None
         created.append(preview)
-        print_progress("would_create", kind, payload, board, monday_item, preview, progress=progress)
+        # print_progress("would_create", kind, payload, board, monday_item, preview, progress=progress)
         return preview
 
-    print_progress("create_start", kind, payload, board, monday_item, progress=progress)
+    # print_progress("create_start", kind, payload, board, monday_item, progress=progress)
     try:
         tile = client.create_tile(payload)
     except Exception as exc:
@@ -762,7 +722,6 @@ def ensure_tile(
             ) from exc
         raise
     existing_by_custom_data[custom_data] = tile
-    existing_by_name_layer.setdefault(tile_name_layer_key(payload), []).append(tile)
     created.append(tile)
     print_progress("created", kind, payload, board, monday_item, tile, progress=progress)
     return tile
@@ -784,10 +743,10 @@ def update_existing_tile(
         preview = dict(update_payload)
         preview["id"] = existing.get("id")
         updated.append(preview)
-        print_progress("would_update", kind, payload, board, monday_item, preview, progress=progress)
+        # print_progress("would_update", kind, payload, board, monday_item, preview, progress=progress)
         return preview
 
-    print_progress("update_start", kind, payload, board, monday_item, existing, progress=progress)
+    # print_progress("update_start", kind, payload, board, monday_item, existing, progress=progress)
     try:
         tile = client.update_tile(existing.get("id"), update_payload)
     except Exception as exc:
@@ -820,26 +779,26 @@ def archive_duplicate_tiles(
         if not execute:
             preview = dict(archive_payload)
             archived_duplicates.append(preview)
-            print_progress("would_archive_duplicate", kind, progress_payload, board, monday_item, duplicate, progress=progress)
+            # print_progress("would_archive_duplicate", kind, progress_payload, board, monday_item, duplicate, progress=progress)
             continue
 
-        print_progress("archive_duplicate_start", kind, progress_payload, board, monday_item, duplicate, progress=progress)
+        # print_progress("archive_duplicate_start", kind, progress_payload, board, monday_item, duplicate, progress=progress)
         try:
             archived = client.update_tile(duplicate.get("id"), archive_payload)
         except Exception as exc:
-            print_progress(
-                "archive_duplicate_failed",
-                kind,
-                progress_payload,
-                board,
-                monday_item,
-                duplicate,
-                error=str(exc),
-                progress=progress,
-            )
+            # print_progress(
+            #     "archive_duplicate_failed",
+            #     kind,
+            #     progress_payload,
+            #     board,
+            #     monday_item,
+            #     duplicate,
+            #     error=str(exc),
+            #     progress=progress,
+            # )
             raise
         archived_duplicates.append(archived)
-        print_progress("archived_duplicate", kind, progress_payload, board, monday_item, archived, progress=progress)
+        # print_progress("archived_duplicate", kind, progress_payload, board, monday_item, archived, progress=progress)
 
 
 def managed_layer_ids(layer_ids: LayerIds) -> set[int]:
@@ -860,21 +819,22 @@ def layer_delete_rank(layer_ids: LayerIds, layer: Any) -> int:
 def stale_monday_tiles(
     existing_tiles: List[Dict[str, Any]],
     layer_ids: LayerIds,
-    desired_name_layer_keys: set[Tuple[int, str]],
-    protected_tile_ids: set[str],
+    synced_tile_ids: set[str],
 ) -> List[Dict[str, Any]]:
     stale = []
     layer_id_set = managed_layer_ids(layer_ids)
     for tile in existing_tiles:
-        if str(tile.get("id")) in protected_tile_ids:
+        tile_id_value = tile.get("id")
+        if tile_id_value is None:
+            continue
+        if str(tile_id_value) in synced_tile_ids:
             continue
         layer = as_int(tile.get("layer"))
         if layer not in layer_id_set:
             continue
         if tile.get("archived") is True:
             continue
-        if tile_name_layer_key(tile) not in desired_name_layer_keys:
-            stale.append(tile)
+        stale.append(tile)
 
     return sorted(
         stale,
@@ -904,10 +864,9 @@ def delete_stale_tiles(
 
         if not execute:
             deleted_stale.append(tile)
-            print_progress("would_delete_stale", "stale", payload, board, monday_item, tile, progress=progress)
+            # print_progress("would_delete_stale", "stale", payload, board, monday_item, tile, progress=progress)
             continue
 
-        print_progress("delete_stale_start", "stale", payload, board, monday_item, tile, progress=progress)
         try:
             client.delete_tile(tile.get("id"))
         except Exception as exc:
@@ -919,11 +878,6 @@ def delete_stale_tiles(
         deleted_stale.append(tile)
         print_progress("deleted_stale", "stale", payload, board, monday_item, tile, progress=progress)
 
-
-def remember_desired_tile(payload: Dict[str, Any], desired_name_layer_keys: set[Tuple[int, str]]) -> None:
-    key = tile_name_layer_key(payload)
-    if key[0] != -1 and key[1]:
-        desired_name_layer_keys.add(key)
 
 
 def compact_monday_data(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -974,22 +928,19 @@ def print_progress(
         "parents": payload.get("parents"),
         "board_id": board.get("id"),
         "board_name": board.get("name"),
-        "customData": payload.get("customData"),
+        # "customData": payload.get("customData"),
         # "monday_data": compact_monday_data(monday_item),
     }
     if error:
         event["error"] = error
-    # print("PROGRESS " + json.dumps(event, ensure_ascii=True, default=str))
+    print("PROGRESS " + json.dumps(event, ensure_ascii=True, default=str))
 
 
 def monday_description(kind: str, item: Dict[str, Any], board: Dict[str, Any], extra: str = "") -> str:
-    return compact_text(
-        f"Source: Monday.com {kind}",
-        f"Board: {board.get('name')} ({board.get('id')})",
-        f"Monday ID: {item.get('id')}",
-        f"URL: {item.get('url')}" if item.get("url") else "",
-        extra,
-    )
+    lines = [f"URL: {item.get('url')}" if item.get("url") else ""]
+    if kind == "item" and extra:
+        lines.append(extra)
+    return compact_text(*lines)
 
 
 def ensure_unassigned_epic_tile(
@@ -1070,15 +1021,11 @@ def sync_monday_to_timebuzzer(
     timebuzzer = TimeBuzzerClient(timebuzzer_api_key, base_url=timebuzzer_base_url)
 
     existing_tiles = timebuzzer.get_all_tiles()
-    print(layer_ids_csv, layer_ids)
-    print("sync_monday_to_timebuzzer")
     layer_ids = layer_ids or parse_layer_ids(layer_ids_csv, existing_tiles=existing_tiles)
-    print(layer_ids)
-    print("sdlkfjlskdfj")
     existing_by_custom_data = existing_tiles_by_custom_data(existing_tiles)
     existing_by_name_layer = existing_tiles_by_name_layer(existing_tiles)
     if progress:
-        print(
+        logger.info(
             "PROGRESS "
             + json.dumps(
                 {
@@ -1112,29 +1059,29 @@ def sync_monday_to_timebuzzer(
         count=latest_sprint_count,
     )
     selected_items = filter_items_by_sprints(backlog_items, backlog_meta, sprint_keys)
-    if progress:
-        print(
-            "PROGRESS "
-            + json.dumps(
-                {
-                    "action": "monday_data_loaded",
-                    "workspace_id": workspace_id,
-                    "boards": {
-                        "epic": {"id": epic_board.get("id"), "name": epic_board.get("name")},
-                        "sprint_backlog": {"id": backlog_board.get("id"), "name": backlog_board.get("name")},
-                        "sprints": {"id": sprint_board.get("id"), "name": sprint_board.get("name")} if sprint_board else None,
-                    },
-                    "latest_sprint_keys": sprint_keys,
-                    "counts": {
-                        "epics": len(epic_items),
-                        "backlog_items": len(backlog_items),
-                        "selected_items": len(selected_items),
-                        "selected_subitems": sum(len(item.get("subitems") or []) for item in selected_items),
-                    },
-                },
-                ensure_ascii=True,
-            )
-        )
+    # if progress:
+    #     print(
+    #         "PROGRESS "
+    #         + json.dumps(
+    #             {
+    #                 "action": "monday_data_loaded",
+    #                 "workspace_id": workspace_id,
+    #                 "boards": {
+    #                     "epic": {"id": epic_board.get("id"), "name": epic_board.get("name")},
+    #                     "sprint_backlog": {"id": backlog_board.get("id"), "name": backlog_board.get("name")},
+    #                     "sprints": {"id": sprint_board.get("id"), "name": sprint_board.get("name")} if sprint_board else None,
+    #                 },
+    #                 "latest_sprint_keys": sprint_keys,
+    #                 "counts": {
+    #                     "epics": len(epic_items),
+    #                     "backlog_items": len(backlog_items),
+    #                     "selected_items": len(selected_items),
+    #                     "selected_subitems": sum(len(item.get("subitems") or []) for item in selected_items),
+    #                 },
+    #             },
+    #             ensure_ascii=True,
+    #         )
+    #     )
 
     created: List[Dict[str, Any]] = []
     updated: List[Dict[str, Any]] = []
@@ -1142,7 +1089,6 @@ def sync_monday_to_timebuzzer(
     archived_duplicates: List[Dict[str, Any]] = []
     deleted_stale: List[Dict[str, Any]] = []
     failed_stale_deletes: List[Dict[str, Any]] = []
-    desired_name_layer_keys: set[Tuple[int, str]] = set()
     synced_tile_ids: set[str] = set()
 
     epic_tiles_by_id: Dict[str, Dict[str, Any]] = {}
@@ -1156,7 +1102,6 @@ def sync_monday_to_timebuzzer(
             color="#4F46E5FF",
             description=monday_description("epic", epic, epic_board),
         )
-        remember_desired_tile(payload, desired_name_layer_keys)
         tile = ensure_tile(
             timebuzzer,
             payload,
@@ -1183,14 +1128,6 @@ def sync_monday_to_timebuzzer(
     for item in selected_items:
         parent_ids = find_epic_parent_ids(item, backlog_meta, epic_tiles_by_id, epic_tiles_by_name)
         if not parent_ids:
-            remember_desired_tile(
-                make_tile_payload(
-                    name="No Epic",
-                    layer_id=layer_ids.epic,
-                    custom_data="monday:epic:unassigned",
-                ),
-                desired_name_layer_keys,
-            )
             fallback_epic_tile = ensure_unassigned_epic_tile(
                 timebuzzer=timebuzzer,
                 existing_by_custom_data=existing_by_custom_data,
@@ -1219,7 +1156,6 @@ def sync_monday_to_timebuzzer(
             color="#0891B2FF",
             description=monday_description("item", item, backlog_board, f"Sprint: {sprint_names}" if sprint_names else ""),
         )
-        remember_desired_tile(payload, desired_name_layer_keys)
         tile = ensure_tile(
             timebuzzer,
             payload,
@@ -1251,7 +1187,6 @@ def sync_monday_to_timebuzzer(
                 color="#16A34AFF",
                 description=monday_description("subitem", subitem, backlog_board, f"Parent item: {item.get('name')}"),
             )
-            remember_desired_tile(payload, desired_name_layer_keys)
             subitem_tile = ensure_tile(
                 timebuzzer,
                 payload,
@@ -1270,38 +1205,15 @@ def sync_monday_to_timebuzzer(
             if subitem_tile.get("id") is not None:
                 synced_tile_ids.add(str(subitem_tile.get("id")))
 
-    stale_tiles = stale_monday_tiles(existing_tiles, layer_ids, desired_name_layer_keys, synced_tile_ids)
-    if progress:
-        print(
-            "PROGRESS "
-            + json.dumps(
-                {
-                    "action": "stale_tiles_selected",
-                    "count": len(stale_tiles),
-                    "comparison": "layer_and_name",
-                    "desired_names": [
-                        {"layer": layer, "name": name}
-                        for layer, name in sorted(desired_name_layer_keys, key=lambda item: (item[0], item[1]))
-                    ],
-                    "stale_tiles": [
-                        {
-                            "id": tile.get("id"),
-                            "layer": tile.get("layer"),
-                            "name": tile.get("name"),
-                            "customData": tile.get("customData"),
-                        }
-                        for tile in stale_tiles
-                    ],
-                },
-                ensure_ascii=True,
-            )
-        )
+    stale_tiles = stale_monday_tiles(existing_tiles, layer_ids, synced_tile_ids)
     delete_stale_tiles(timebuzzer, stale_tiles, execute, deleted_stale, failed_stale_deletes, progress)
 
     return {
         "mode": "execute" if execute else "dry_run",
         "workspace_id": workspace_id,
         "layers": {"epic": layer_ids.epic, "item": layer_ids.item, "subitem": layer_ids.subitem},
+        "sprint_filter": "latest_sprints",
+        "stale_tile_cleanup": "id_based",
         "boards": {
             "epic": {"id": epic_board.get("id"), "name": epic_board.get("name")},
             "sprint_backlog": {"id": backlog_board.get("id"), "name": backlog_board.get("name")},
@@ -1383,19 +1295,19 @@ def main() -> int:
     stale_failed = summary["timebuzzer_counts"]["failed_stale_deletes"]
     skipped = summary["timebuzzer_counts"]["skipped_existing"]
     mode = summary["mode"]
-    print(f"timeBuzzer sync complete ({mode}).")
-    print(f"Workspace: {summary['workspace_id']}")
-    print(f"Layers: {summary['layers']}")
-    print(f"Monday counts: {summary['monday_counts']}")
-    print(
-        "timeBuzzer: "
-        f"{created} {'created' if args.execute else 'would be created'}, "
-        f"{updated} {'updated' if args.execute else 'would be updated'}, "
-        f"{archived} duplicate(s) {'archived' if args.execute else 'would be archived'}, "
-        f"{stale_deleted} stale tile(s) {'deleted' if args.execute else 'would be deleted'}, "
-        f"{stale_failed} stale delete failure(s), "
-        f"{skipped} skipped existing"
-    )
+    # print(f"timeBuzzer sync complete ({mode}).")
+    # print(f"Workspace: {summary['workspace_id']}")
+    # print(f"Layers: {summary['layers']}")
+    # print(f"Monday counts: {summary['monday_counts']}")
+    # print(
+    #     "timeBuzzer: "
+    #     f"{created} {'created' if args.execute else 'would be created'}, "
+    #     f"{updated} {'updated' if args.execute else 'would be updated'}, "
+    #     f"{archived} duplicate(s) {'archived' if args.execute else 'would be archived'}, "
+    #     f"{stale_deleted} stale tile(s) {'deleted' if args.execute else 'would be deleted'}, "
+    #     f"{stale_failed} stale delete failure(s), "
+    #     f"{skipped} skipped existing"
+    # )
     if not args.execute:
         print("Dry run only. Re-run with --execute to create missing tiles.")
 

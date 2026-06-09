@@ -6,6 +6,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 import threading
 import time
+import timebuzzer as timebuzzer_sync
 # Load environment variables from .env file FIRST (before importing config)
 load_dotenv()
 
@@ -148,15 +149,6 @@ def health_check():
         'status': 'healthy',
         'integrations': integrations_status
     })
-
-@app.route('/api/timebuzzer', methods=['GET'])
-def timebuzzer():
-    """Timebuzzer endpoint."""
-
-    print("""Performing timebuzzer check...""")
-    # timebuzzer.main()
-
-    return "<h1>Timebuzzer</h1><p>Server is running!</p>"
 
 # ==================== SPRINT REPORT ENDPOINTS ====================
 
@@ -1149,12 +1141,12 @@ def sync_item_columns():
         new_value = event.get('value', {})
         
         # Loop prevention: Check if this webhook is triggered by our own update
-        if item_id and column_id and _is_self_triggered_update(item_id, str(column_id)):
-            logger.info(f"Skipping sync-item for {item_id}/{column_id} - self-triggered update (loop prevention)")
-            return jsonify({
-                'status': 'skipped',
-                'message': 'Skipped self-triggered update to prevent loop'
-            }), 200
+        # if item_id and column_id and _is_self_triggered_update(item_id, str(column_id)):
+        #     logger.info(f"Skipping sync-item for {item_id}/{column_id} - self-triggered update (loop prevention)")
+        #     return jsonify({
+        #         'status': 'skipped',
+        #         'message': 'Skipped self-triggered update to prevent loop'
+        #     }), 200
         
         if not item_id or not board_id or not column_id:
             logger.error(f"Missing required fields. pulseId={item_id}, boardId={board_id}, columnId={column_id}")
@@ -2006,12 +1998,12 @@ def sync_subitem_columns():
         column_id = str(event.get('columnId') or event.get('column_id', ''))
         
         # Loop prevention: Check if this webhook is triggered by our own update
-        if subitem_id and column_id and _is_self_triggered_update(subitem_id, column_id):
-            logger.info(f"Skipping sync-subitem for {subitem_id}/{column_id} - self-triggered update (loop prevention)")
-            return jsonify({
-                'status': 'skipped',
-                'message': 'Skipped self-triggered update to prevent loop'
-            }), 200
+        # if subitem_id and column_id and _is_self_triggered_update(subitem_id, column_id):
+        #     logger.info(f"Skipping sync-subitem for {subitem_id}/{column_id} - self-triggered update (loop prevention)")
+        #     return jsonify({
+        #         'status': 'skipped',
+        #         'message': 'Skipped self-triggered update to prevent loop'
+        #     }), 200
         column_id = event.get('columnId') or event.get('column_id', '')
         new_value = event.get('value', {})
         
@@ -2572,6 +2564,7 @@ def sync_epic_columns():
         return jsonify({'error': str(e), 'status': 'error'}), 500
 
 
+# ==================== SYNC TIMEBUZZER AND MONDAY ENDPOINT ====================
 def parse_bool(value, default=False):
     if value is None:
         return default
@@ -2595,7 +2588,521 @@ def request_value(payload, key, default=None):
     return request.args.get(key, default)
 
 
-@app.route('/api/timebuzzer/sync', methods=['GET', 'POST'])
+def validate_layer_ids_csv(layer_ids_csv):
+    if not layer_ids_csv:
+        return None
+
+    parts = [part.strip() for part in str(layer_ids_csv).split(",") if part.strip()]
+    if len(parts) != 3:
+        return "layer_ids must contain exactly three comma-separated IDs: epic,item,subitem"
+
+    try:
+        [int(part) for part in parts]
+    except ValueError:
+        return "layer_ids must contain numeric IDs only: epic,item,subitem"
+
+    return None
+
+
+def start_sync_timebuzzer_tiles(workspace_id,
+        latest_sprint_count,
+        execute,
+        layer_ids_csv,
+        timebuzzer_base_url,
+        progress,
+        ):
+    try:
+        summary = timebuzzer_sync.sync_monday_to_timebuzzer(
+            workspace_id=workspace_id,
+            latest_sprint_count=latest_sprint_count,
+            execute=execute,
+            layer_ids_csv=layer_ids_csv,
+            timebuzzer_base_url=timebuzzer_base_url,
+            progress=progress,
+        )
+
+        counts = summary["timebuzzer_counts"]
+        created = counts["created_or_would_create"]
+        updated = counts["updated_or_would_update"]
+        archived = counts["archived_duplicates_or_would_archive"]
+        stale_deleted = counts["deleted_stale_or_would_delete"]
+        stale_failed = counts["failed_stale_deletes"]
+        skipped = counts["skipped_existing"]
+        mode = summary["mode"]
+        logger.info("timeBuzzer sync complete (%s).", mode)
+        logger.info("Workspace: %s", summary["workspace_id"])
+        logger.info("Layers: %s", summary["layers"])
+        logger.info("Monday counts: %s", summary["monday_counts"])
+        logger.info(
+            "timeBuzzer: %s %s, %s %s, %s duplicate(s) %s, "
+            "%s stale tile(s) %s, %s stale delete failure(s), %s skipped existing",
+            created,
+            "created" if execute else "would be created",
+            updated,
+            "updated" if execute else "would be updated",
+            archived,
+            "archived" if execute else "would be archived",
+            stale_deleted,
+            "deleted" if execute else "would be deleted",
+            stale_failed,
+            skipped,
+        )
+    except Exception as exc:
+        logger.error("TimeBuzzer background sync failed: %s", exc, exc_info=True)
+
+
+
+TIMEBUZZER_ACTIVITY_CACHE = {}
+TIMEBUZZER_ACTIVITY_CACHE_LIMIT = 1000
+TIMEBUZZER_ACTIVITY_CACHE_PATH = os.environ.get(
+    "TIMEBUZZER_ACTIVITY_CACHE_FILE",
+    os.path.join(os.path.dirname(__file__), ".timebuzzer_activity_cache.json"),
+)
+TIMEBUZZER_ACTIVITY_CACHE_LOCK = threading.Lock()
+
+
+class TimeBuzzerActivityDetailsUnavailable(Exception):
+    pass
+
+
+def load_timebuzzer_activity_cache():
+    if TIMEBUZZER_ACTIVITY_CACHE:
+        return
+    try:
+        with open(TIMEBUZZER_ACTIVITY_CACHE_PATH, "r", encoding="utf-8") as cache_file:
+            data = json.load(cache_file)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as exc:
+        logger.warning("Could not load TimeBuzzer activity cache: %s", exc)
+        return
+    if isinstance(data, dict):
+        TIMEBUZZER_ACTIVITY_CACHE.update({str(key): value for key, value in data.items() if isinstance(value, dict)})
+
+
+def save_timebuzzer_activity_cache():
+    try:
+        with open(TIMEBUZZER_ACTIVITY_CACHE_PATH, "w", encoding="utf-8") as cache_file:
+            json.dump(TIMEBUZZER_ACTIVITY_CACHE, cache_file)
+    except OSError as exc:
+        logger.warning("Could not save TimeBuzzer activity cache: %s", exc)
+
+
+def remember_timebuzzer_activity(payload):
+    activity_id = timebuzzer_activity_payload_id(payload) if isinstance(payload, dict) else None
+    if activity_id is None:
+        return
+    with TIMEBUZZER_ACTIVITY_CACHE_LOCK:
+        load_timebuzzer_activity_cache()
+        TIMEBUZZER_ACTIVITY_CACHE[str(activity_id)] = dict(payload)
+        while len(TIMEBUZZER_ACTIVITY_CACHE) > TIMEBUZZER_ACTIVITY_CACHE_LIMIT:
+            TIMEBUZZER_ACTIVITY_CACHE.pop(next(iter(TIMEBUZZER_ACTIVITY_CACHE)))
+        save_timebuzzer_activity_cache()
+
+
+def cached_timebuzzer_activity(activity_id):
+    with TIMEBUZZER_ACTIVITY_CACHE_LOCK:
+        load_timebuzzer_activity_cache()
+        cached = TIMEBUZZER_ACTIVITY_CACHE.get(str(activity_id))
+    return dict(cached) if cached else None
+
+
+def parse_timebuzzer_datetime(value):
+    if not value:
+        raise ValueError("TimeBuzzer activity date is missing")
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def timebuzzer_activity_duration_hours(payload):
+    start = parse_timebuzzer_datetime(payload.get("startDate"))
+    end = parse_timebuzzer_datetime(payload.get("endDate"))
+    seconds = (end - start).total_seconds()
+    if seconds < 0:
+        raise ValueError("TimeBuzzer activity endDate is before startDate")
+    return round(seconds / 3600, 4)
+
+
+def monday_refs_from_timebuzzer_tiles(tiles):
+    refs = {}
+    for tile in tiles or []:
+        custom_data = str(tile.get("customData") or "")
+        parts = custom_data.split(":", 2)
+        if len(parts) != 3 or parts[0] != "monday" or parts[1] not in {"epic", "item", "subitem"}:
+            continue
+        refs[parts[1]] = {
+            "id": parts[2],
+            "tile_id": tile.get("id"),
+            "tile_name": tile.get("name"),
+            "customData": custom_data,
+        }
+    return refs
+
+
+def timebuzzer_tile_ids_from_payload(payload):
+    ids = []
+    for tile in payload.get("tiles") or []:
+        tile_id = tile.get("id")
+        if tile_id is not None:
+            ids.append(int(tile_id))
+    return ids
+
+
+def timebuzzer_tile_filter_from_payload(payload):
+    tile_filter = {}
+    for tile in payload.get("tiles") or []:
+        tile_id = tile.get("id")
+        layer_index = tile.get("layerIndex")
+        if tile_id is None or layer_index is None:
+            continue
+        tile_filter.setdefault(str(layer_index), []).append(int(tile_id))
+    return tile_filter
+
+
+def activity_value(activity, *names):
+    for name in names:
+        if name in activity:
+            return activity.get(name)
+    return None
+
+
+def activity_tile_ids(activity):
+    tiles = activity.get("tiles") or activity.get("tiles_") or []
+    ids = []
+    for tile in tiles:
+        if isinstance(tile, dict):
+            tile_id = tile.get("id")
+        else:
+            tile_id = tile
+        if tile_id is not None:
+            ids.append(int(tile_id))
+    return ids
+
+
+def is_same_timebuzzer_activity(payload, activity):
+    activity_user_id = activity_value(activity, "userId", "user_id")
+    if activity_user_id is None and isinstance(activity.get("user"), dict):
+        activity_user_id = activity["user"].get("id")
+    if str(activity_user_id) != str(payload.get("userId")):
+        return False
+
+    return sorted(activity_tile_ids(activity)) == sorted(timebuzzer_tile_ids_from_payload(payload))
+
+
+def timebuzzer_activity_payload_id(payload):
+    return activity_value(payload, "id", "activityId", "activity_id")
+
+
+def timebuzzer_api_client():
+    api_key = app.config.get("TIMEBUZZER_API_KEY") or os.environ.get("TIMEBUZZER_API_KEY")
+    if not api_key:
+        raise RuntimeError("TIMEBUZZER_API_KEY is missing.")
+    return timebuzzer_sync.TimeBuzzerClient(
+        api_key,
+        base_url=app.config.get("TIMEBUZZER_BASE_URL", timebuzzer_sync.TIMEBUZZER_BASE_URL),
+    )
+
+
+def normalize_timebuzzer_activity_payload(payload, activity_type):
+    normalized = dict(payload or {})
+    activity_id = timebuzzer_activity_payload_id(normalized)
+    if activity_id is not None:
+        normalized.setdefault("id", activity_id)
+
+    has_activity_details = (
+        normalized.get("startDate")
+        and normalized.get("endDate")
+        and normalized.get("tiles")
+        and normalized.get("userId") is not None
+    )
+    if has_activity_details:
+        remember_timebuzzer_activity(normalized)
+        return normalized
+
+    if activity_type != "delete":
+        return normalized
+    if activity_id is None:
+        raise ValueError("TimeBuzzer delete payload is missing activityId")
+
+    cached = cached_timebuzzer_activity(activity_id)
+    if cached:
+        cached.setdefault("id", activity_id)
+        cached.setdefault("activityId", activity_id)
+        logger.info("Using cached TimeBuzzer deleted activity details for activityId=%s", activity_id)
+        return cached
+
+    try:
+        fetched = timebuzzer_api_client().get_activity(activity_id)
+    except Exception as exc:
+        message = str(exc)
+        if "404" in message or "not found" in message.lower():
+            raise TimeBuzzerActivityDetailsUnavailable(
+                f"TimeBuzzer deleted activity {activity_id} was not found and is not in the local cache. "
+                "Cannot determine user, tiles, duration, or Monday target for this delete webhook."
+            ) from exc
+        raise
+    fetched_payload = dict(fetched)
+    fetched_payload.setdefault("id", activity_id)
+    fetched_payload.setdefault("activityId", activity_id)
+    remember_timebuzzer_activity(fetched_payload)
+    logger.info(
+        "Fetched TimeBuzzer deleted activity details for activityId=%s: userId=%s, tiles=%s, startDate=%s, endDate=%s",
+        activity_id,
+        fetched_payload.get("userId"),
+        [tile.get("id") for tile in fetched_payload.get("tiles") or [] if isinstance(tile, dict)],
+        fetched_payload.get("startDate"),
+        fetched_payload.get("endDate"),
+    )
+    return fetched_payload
+
+
+def matching_timebuzzer_activities(payload):
+    filters = {
+        "userIds": [int(payload.get("userId"))],
+        "tiles": timebuzzer_tile_filter_from_payload(payload),
+    }
+    activities = timebuzzer_api_client().filter_activities(filters, count=100)
+    return [activity for activity in activities if is_same_timebuzzer_activity(payload, activity)]
+
+
+def timebuzzer_activity_duration_from_activity(activity):
+    start = activity_value(activity, "startDate", "start_date", "start")
+    end = activity_value(activity, "endDate", "end_date", "end")
+    return timebuzzer_activity_duration_hours({
+        "startDate": start,
+        "endDate": end,
+    })
+
+
+def timebuzzer_activity_id(activity):
+    return activity_value(activity, "id", "activityId", "activity_id")
+
+
+def timebuzzer_activity_duration_summary(payload, activity_type):
+    current_activity_id = timebuzzer_activity_payload_id(payload)
+    current_duration_hours = timebuzzer_activity_duration_hours(payload)
+    matching_activities = matching_timebuzzer_activities(payload)
+
+    matched_duration_hours = 0.0
+    included_current_activity = False
+    counted_activity_ids = []
+    excluded_activity_ids = []
+    for activity in matching_activities:
+        activity_id = timebuzzer_activity_id(activity)
+        if (
+            activity_type == "delete"
+            and current_activity_id is not None
+            and str(activity_id) == str(current_activity_id)
+        ):
+            excluded_activity_ids.append(activity_id)
+            continue
+        matched_duration_hours += timebuzzer_activity_duration_from_activity(activity)
+        counted_activity_ids.append(activity_id)
+        if current_activity_id is not None and str(activity_id) == str(current_activity_id):
+            included_current_activity = True
+
+    total_duration_hours = matched_duration_hours
+    if activity_type in {"new", "edit"} and not included_current_activity:
+        total_duration_hours += current_duration_hours
+
+    return {
+        "current_duration_hours": round(current_duration_hours, 4),
+        "matched_duration_hours": round(matched_duration_hours, 4),
+        "remaining_duration_hours": round(matched_duration_hours, 4),
+        "total_duration_hours": round(total_duration_hours, 4),
+        "matching_activity_count": len(matching_activities),
+        "counted_activity_count": len(counted_activity_ids),
+        "counted_activity_ids": counted_activity_ids,
+        "excluded_activity_ids": excluded_activity_ids,
+        "included_current_activity": included_current_activity,
+    }
+
+
+def actual_hours_from_target(target, column_id):
+    for column_value in target.get("column_values") or []:
+        if str(column_value.get("id")) != str(column_id):
+            continue
+        value = column_value.get("value")
+        text = column_value.get("text")
+        try:
+            parsed = json.loads(value) if isinstance(value, str) else value
+            if isinstance(parsed, dict):
+                return float(parsed.get("value") or 0)
+            if parsed not in (None, ""):
+                return float(parsed)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        try:
+            return float(str(text or "0").replace(",", "").replace(" Hrs", "").replace("Hrs", "").strip() or 0)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def update_monday_actual_hours_from_timebuzzer(payload, activity_type):
+    if monday_api is None:
+        raise RuntimeError("Monday API is not initialized.")
+
+    try:
+        payload = normalize_timebuzzer_activity_payload(payload, activity_type)
+    except TimeBuzzerActivityDetailsUnavailable as exc:
+        logger.warning("TimeBuzzer %s activity skipped: %s", activity_type, exc)
+        return {
+            "status": "skipped",
+            "reason": str(exc),
+            "activity_type": activity_type,
+            "timebuzzer_entry_id": timebuzzer_activity_payload_id(payload),
+        }, 200
+
+    duration_hours = timebuzzer_activity_duration_hours(payload)
+    refs = monday_refs_from_timebuzzer_tiles(payload.get("tiles") or [])
+
+    if "subitem" in refs:
+        target_type = "subitem"
+        target_id = refs["subitem"]["id"]
+        target = monday_api.get_subitem_with_parent(target_id)
+        if not target:
+            return {
+                "status": "error",
+                "error": f"Monday subitem {target_id} was not found.",
+            }, 404
+
+        parent_item = target.get("parent_item") or {}
+        if refs.get("item") and str(parent_item.get("id")) != str(refs["item"]["id"]):
+            item_ref_id = refs["item"]["id"]
+            return {
+                "status": "error",
+                "error": (
+                    f"Subitem {target_id} does not belong to item {item_ref_id} "
+                    "from the TimeBuzzer tile path."
+                ),
+            }, 400
+    elif "item" in refs:
+        target_type = "item"
+        target_id = refs["item"]["id"]
+        target = monday_api.get_item_with_columns(target_id)
+        if not target:
+            return {
+                "status": "error",
+                "error": f"Monday item {target_id} was not found.",
+            }, 404
+    else:
+        return {
+            "status": "skipped",
+            "reason": "No mapped Monday item/subitem tile was found in TimeBuzzer payload.",
+            "timebuzzer_entry_id": timebuzzer_activity_payload_id(payload),
+        }, 200
+
+    board = target.get("board") or {}
+    board_id = str(board.get("id") or "")
+    if not board_id:
+        return {
+            "status": "error",
+            "error": f"Could not determine Monday board for {target_type} {target_id}.",
+        }, 400
+
+    columns = monday_api.get_board_columns(board_id)
+    actual_col_id, actual_col_title = find_hours_column_id(columns, "actual")
+    if not actual_col_id:
+        return {
+            "status": "error",
+            "error": f"Actual Hrs column was not found on Monday board {board_id}.",
+            "target_type": target_type,
+            "target_id": target_id,
+        }, 404
+
+    original_actual_hours = actual_hours_from_target(target, actual_col_id)
+    duration_summary = timebuzzer_activity_duration_summary(payload, activity_type)
+    matching_activity_exists = duration_summary["matching_activity_count"] > 0
+    actual_hours_to_write = duration_summary["total_duration_hours"]
+    logger.info(
+        "____________________TimeBuzzer %s activity writing Monday Actual Hrs=%s for %s %s on board %s "
+        "(entry_id=%s, current_duration=%s, remaining_duration=%s, matching_count=%s, "
+        "counted_count=%s, counted_ids=%s, excluded_ids=%s, included_current=%s, "
+        "original_actual=%s, column=%s/%s)",
+        activity_type,
+        actual_hours_to_write,
+        target_type,
+        target_id,
+        board_id,
+        timebuzzer_activity_payload_id(payload),
+        duration_summary["current_duration_hours"],
+        duration_summary["matched_duration_hours"],
+        duration_summary["matching_activity_count"],
+        duration_summary["counted_activity_count"],
+        duration_summary["counted_activity_ids"],
+        duration_summary["excluded_activity_ids"],
+        duration_summary["included_current_activity"],
+        original_actual_hours,
+        actual_col_title,
+        actual_col_id,
+    )
+
+    value = json.dumps({"value": actual_hours_to_write, "unit": None})
+    updated = monday_api.update_column_value(board_id, target_id, actual_col_id, value, "numeric")
+    if updated:
+        _mark_update_made(target_id, actual_col_id)
+
+    return {
+        "status": "success" if updated else "error",
+        "activity_type": activity_type,
+        "timebuzzer_entry_id": timebuzzer_activity_payload_id(payload),
+        "duration_hours": duration_hours,
+        "matching_activity_exists": matching_activity_exists,
+        "matching_activity_count": duration_summary["matching_activity_count"],
+        "counted_activity_count": duration_summary["counted_activity_count"],
+        "counted_activity_ids": duration_summary["counted_activity_ids"],
+        "matched_duration_hours": duration_summary["matched_duration_hours"],
+        "remaining_duration_hours": duration_summary["remaining_duration_hours"],
+        "excluded_activity_ids": duration_summary["excluded_activity_ids"],
+        "included_current_activity": duration_summary["included_current_activity"],
+        "original_actual_hours": original_actual_hours,
+        "actual_hours_written": actual_hours_to_write,
+        "target_type": target_type,
+        "target_id": target_id,
+        "target_name": target.get("name"),
+        "board_id": board_id,
+        "actual_hours_column_id": actual_col_id,
+        "actual_hours_column_title": actual_col_title,
+        "monday_refs": refs,
+    }, 200 if updated else 500
+
+
+def handle_timebuzzer_activity(activity_type):
+    payload = request.get_json(silent=True) or {}
+    logger.info("TimeBuzzer %s activity payload: %s", activity_type, payload)
+
+    try:
+        result, status_code = update_monday_actual_hours_from_timebuzzer(payload, activity_type)
+    except Exception as exc:
+        logger.error("TimeBuzzer %s activity handling failed: %s", activity_type, exc, exc_info=True)
+        return jsonify({"status": "error", "error": str(exc)}), 500
+
+    if status_code >= 400:
+        logger.warning("TimeBuzzer %s activity was not applied: %s", activity_type, result)
+    else:
+        logger.info("TimeBuzzer %s activity applied: %s", activity_type, result)
+    return jsonify(result), status_code
+
+
+@app.route("/api/timebuzzer/newActivity", methods=["POST"])
+def receive_timebuzzer_new_activity():
+    return handle_timebuzzer_activity("new")
+
+
+@app.route("/api/timebuzzer/editActivity", methods=["POST"])
+def receive_timebuzzer_eidt_activity():
+    return handle_timebuzzer_activity("edit")
+
+
+receive_timebuzzer_edit_activity = receive_timebuzzer_eidt_activity
+
+
+@app.route("/api/timebuzzer/deleteActivity", methods=["POST"])
+def receive_timebuzzer_delete_activity():
+    return handle_timebuzzer_activity("delete")
+
+
+@app.route("/api/timebuzzer/sync", methods=["GET", "POST"])
 def sync_timebuzzer_tiles():
     """
     Sync Monday.com epics, Sprint Backlog items, and subitems into timeBuzzer.
@@ -2611,38 +3118,50 @@ def sync_timebuzzer_tiles():
     payload = request.get_json(silent=True) or {}
 
     workspace_id = str(
-        request_value(payload, 'workspace_id', app.config.get('WORKSPACE_ID_2') or timebuzzer.DEFAULT_WORKSPACE_ID)
+        request_value(payload, "workspace_id", app.config.get("WORKSPACE_ID_2") or timebuzzer_sync.DEFAULT_WORKSPACE_ID)
     )
-    latest_sprints = parse_int(request_value(payload, 'latest_sprints'), 2)
-    execute = parse_bool(request_value(payload, 'execute'), False)
-    progress = parse_bool(request_value(payload, 'progress'), False)
-    layer_ids_arg = request_value(payload, 'layer_ids')
-    base_url = request_value(payload, 'base_url', timebuzzer.TIMEBUZZER_BASE_URL)
+    latest_sprints = parse_int(request_value(payload, "latest_sprints"), 2)
+    execute = parse_bool(request_value(payload, "execute"), True)
+    progress = parse_bool(request_value(payload, "progress"), True)
+    layer_ids_arg = request_value(payload, "layer_ids")
+    base_url = request_value(payload, "base_url", timebuzzer_sync.TIMEBUZZER_BASE_URL)
 
     if latest_sprints < 1:
         return jsonify({
-            'status': 'error',
-            'error': 'latest_sprints must be 1 or greater',
+            "status": "error",
+            "error": "latest_sprints must be 1 or greater",
+        }), 400
+
+    layer_ids_error = validate_layer_ids_csv(layer_ids_arg or os.environ.get("TIMEBUZZER_LAYER_IDS"))
+    if layer_ids_error:
+        return jsonify({
+            "status": "error",
+            "error": layer_ids_error,
         }), 400
 
     try:
-        summary = timebuzzer.sync_monday_to_timebuzzer(
-            workspace_id=workspace_id,
-            latest_sprint_count=latest_sprints,
-            execute=execute,
-            layer_ids_csv=layer_ids_arg,
-            timebuzzer_base_url=base_url,
-            progress=progress,
+        thread = threading.Thread(
+            target=start_sync_timebuzzer_tiles,
+            args=(
+                workspace_id,
+                latest_sprints,
+                execute,
+                layer_ids_arg,
+                base_url,
+                progress,
+            ),
         )
+        thread.daemon = True
+        thread.start()
         return jsonify({
-            'status': 'completed',
-            'summary': summary,
-        })
+            "status": "started",
+            "message": "TimeBuzzer sync has started in the background.",
+        }), 202
     except Exception as exc:
         logger.error("TimeBuzzer sync endpoint failed: %s", exc, exc_info=True)
         return jsonify({
-            'status': 'error',
-            'error': str(exc),
+            "status": "error",
+            "error": str(exc),
         }), 500
 
 
@@ -2651,17 +3170,8 @@ def sync_timebuzzer_tiles():
 @app.route('/api/transfer-to-sprint', methods=['POST'])
 def transfer_item_to_sprint():
     """
-    Handle 'In Transfer' status change on the Main board (Sprint Backlog).
-
-    When an item's status is changed to 'In Transfer', this endpoint:
-      1. Detects the status change
-      2. Finds the latest (newly created) sprint
-      3. Duplicates the item on the same board
-      4. Updates the Sprint column on the duplicate to the latest sprint
-
-    Loop prevention: the duplicate item's status column is registered in the
-    self-update cache immediately after duplication, so the resulting webhook
-    for the newly created item is ignored.
+    When an item's status is 'In Transfer', move it to the latest sprint
+    by updating the Sprint board_relation column on that item.
 
     Expected POST body (Monday.com webhook format):
     {
@@ -2673,9 +3183,10 @@ def transfer_item_to_sprint():
         }
     }
     """
+    logger.info(f"[transfer-to-sprint] raw body: {request.get_data(as_text=True)}")
     raw = request.get_json(silent=True) or {}
+    logger.info(f"[transfer-to-sprint] parsed raw: {raw}")
 
-    # Respond to Monday.com webhook challenge immediately
     if 'challenge' in raw:
         return jsonify({'challenge': raw['challenge']}), 200
 
@@ -2685,7 +3196,6 @@ def transfer_item_to_sprint():
     try:
         data = raw
 
-        # Handle nested JSON string format: {'data': '{"event":{...}}'}
         if 'data' in data and isinstance(data['data'], str):
             try:
                 data = json.loads(data['data'])
@@ -2693,27 +3203,40 @@ def transfer_item_to_sprint():
                 pass
 
         event = data.get('event', data)
+        logger.info(f"[transfer-to-sprint] raw data: {data}")
 
         item_id   = str(event.get('pulseId') or event.get('itemId') or event.get('item_id', ''))
         board_id  = str(event.get('boardId') or event.get('board_id', ''))
         column_id = str(event.get('columnId') or event.get('column_id', ''))
         new_value = event.get('value', {})
 
-        if not item_id or not board_id or not column_id:
+        if not item_id or not board_id:
+            logger.error(f"[transfer-to-sprint] Missing required fields. pulseId={item_id}, boardId={board_id}, columnId={column_id}")
             return jsonify({
-                'error': 'Missing required fields: pulseId/itemId, boardId, columnId',
+                'error': 'Missing required fields: pulseId/itemId, boardId',
                 'status': 'error'
             }), 400
 
         logger.info(f"[transfer-to-sprint] item={item_id}, board={board_id}, column={column_id}")
 
         # ── Loop prevention ──────────────────────────────────────────────────
-        if _is_self_triggered_update(item_id, column_id):
-            logger.info(f"[transfer-to-sprint] Skipping self-triggered update for {item_id}/{column_id}")
-            return jsonify({'status': 'skipped', 'message': 'Self-triggered update ignored'}), 200
+        # if _is_self_triggered_update(item_id, column_id):
+        #     logger.info(f"[transfer-to-sprint] Skipping self-triggered update for {item_id}/{column_id}")
+        #     return jsonify({'status': 'skipped', 'message': 'Self-triggered update ignored'}), 200
 
         # ── Check status label ───────────────────────────────────────────────
+        # column_change events: status is in event.value
+        # create_pulse events:  status is in event.columnValues.<col_id>.label.text
         status_label = extract_status_label_from_value(new_value)
+
+        if not status_label:
+            for col_data in event.get('columnValues', {}).values():
+                if isinstance(col_data, dict) and 'label' in col_data:
+                    label = col_data['label']
+                    status_label = label.get('text', '') if isinstance(label, dict) else str(label)
+                    if status_label:
+                        break
+
         logger.info(f"[transfer-to-sprint] Status changed to: '{status_label}'")
 
         if not is_in_transfer_status(status_label):
@@ -2722,25 +3245,10 @@ def transfer_item_to_sprint():
                 'message': f"Status '{status_label}' is not 'In Transfer' – nothing to do"
             }), 200
 
-        # ── Verify source board is Main board / Sprint Backlog ───────────────
-        source_board = monday_api.get_board_by_id(board_id)
-        if not source_board:
-            return jsonify({'error': f'Board {board_id} not found', 'status': 'error'}), 404
-
-        source_board_name = source_board.get('name', '')
-        board_type = identify_board_type(source_board_name)
-
-        # Accept main_board OR user_stories (Sprint Backlog) boards
-        if board_type not in ('main_board', 'user_stories'):
-            return jsonify({
-                'status': 'skipped',
-                'message': f'Board "{source_board_name}" is not a Main board or Sprint Backlog – skipping'
-            }), 200
-
-        workspace_id = str(source_board.get('workspace', {}).get('id', ''))
-        logger.info(f"[transfer-to-sprint] Board: {source_board_name}, workspace: {workspace_id}")
-
         # ── Find the latest sprint ───────────────────────────────────────────
+        source_board = monday_api.get_board_by_id(board_id)
+        workspace_id = str(source_board.get('workspace', {}).get('id', '')) if source_board else ''
+
         sprints_board = monday_api.get_sprints_board(workspace_id=workspace_id if workspace_id else None)
         if not sprints_board:
             return jsonify({'error': 'Sprints board not found', 'status': 'error'}), 404
@@ -2751,199 +3259,32 @@ def transfer_item_to_sprint():
 
         logger.info(f"[transfer-to-sprint] Latest sprint: {latest_sprint['name']} (ID: {latest_sprint['id']})")
 
-        # ── Duplicate the item (with updates) ───────────────────────────────
-        # with_updates=True copies item updates when supported by Monday API.
-        # We still backfill missing updates below for safety.
-        new_item_id = monday_api.duplicate_item(item_id, board_id, with_updates=True)
-        if not new_item_id:
-            return jsonify({'error': 'Failed to duplicate item', 'status': 'error'}), 500
-
-        logger.info(f"[transfer-to-sprint] Duplicated item {item_id} -> {new_item_id}")
-
-        # Ensure the duplicate has all source item updates (no duplicates).
-        item_updates_result = monday_api.copy_missing_updates(item_id, new_item_id, limit=200)
-        logger.info(
-            "[transfer-to-sprint] Item updates sync result: "
-            f"{item_updates_result}"
-        )
-
-        # Ensure subitems and subitem updates are fully carried over.
-        source_subitems = monday_api.get_item_subitems(item_id)
-        target_subitems = monday_api.get_item_subitems(new_item_id)
-
-        unsupported_types = {
-            'mirror', 'lookup', 'formula', 'auto_number',
-            'creation_log', 'last_updated', 'item_id', 'subtasks',
-            'dependency', 'direct_doc'
-        }
-
-        subitems_result = {
-            'source_count': len(source_subitems),
-            'target_count_before': len(target_subitems),
-            'created': 0,
-            'matched_existing': 0,
-            'column_values_synced': 0,
-            'updates_copied': 0,
-            'update_copy_failed': 0
-        }
-
-        source_subitem_columns_cache = {}
-        target_subitem_columns_cache = {}
-
-        for source_subitem in source_subitems:
-            source_subitem_id = str(source_subitem.get('id', ''))
-            source_subitem_name = source_subitem.get('name', '')
-
-            # Try to match the duplicated subitem first; create if missing.
-            target_subitem = find_matching_subitem(source_subitem_name, target_subitems)
-            if target_subitem:
-                subitems_result['matched_existing'] += 1
-            else:
-                new_subitem_id = monday_api.create_subitem(
-                    parent_item_id=new_item_id,
-                    subitem_name=source_subitem_name
-                )
-                if not new_subitem_id:
-                    logger.warning(
-                        f"[transfer-to-sprint] Failed to create missing subitem '{source_subitem_name}'"
-                    )
-                    continue
-
-                target_subitem = monday_api.get_subitem_with_all_columns(new_subitem_id)
-                if not target_subitem:
-                    logger.warning(
-                        f"[transfer-to-sprint] Could not fetch newly created subitem {new_subitem_id}"
-                    )
-                    continue
-
-                target_subitems.append(target_subitem)
-                subitems_result['created'] += 1
-
-            target_subitem_id = str(target_subitem.get('id', ''))
-
-            # Sync subitem column values from source to target where possible.
-            source_subitem_board_id = str(source_subitem.get('board', {}).get('id', ''))
-            target_subitem_board_id = str(target_subitem.get('board', {}).get('id', ''))
-
-            if source_subitem_board_id and source_subitem_board_id not in source_subitem_columns_cache:
-                source_subitem_columns_cache[source_subitem_board_id] = monday_api.get_board_columns(source_subitem_board_id)
-            if target_subitem_board_id and target_subitem_board_id not in target_subitem_columns_cache:
-                target_subitem_columns_cache[target_subitem_board_id] = monday_api.get_board_columns(target_subitem_board_id)
-
-            source_subitem_columns = source_subitem_columns_cache.get(source_subitem_board_id, [])
-            target_subitem_columns = target_subitem_columns_cache.get(target_subitem_board_id, [])
-
-            for source_cv in source_subitem.get('column_values', []):
-                source_col_id = source_cv.get('id')
-                source_col_type = source_cv.get('type', '')
-                source_col_value = source_cv.get('value')
-
-                if not source_col_id or source_col_type in unsupported_types:
-                    continue
-
-                if not source_col_value or source_col_value == 'null':
-                    continue
-
-                matching_col = find_matching_column(
-                    source_subitem_columns,
-                    target_subitem_columns,
-                    source_col_id
-                )
-
-                if not matching_col:
-                    continue
-
-                target_col_id = matching_col.get('id')
-                target_col_type = matching_col.get('type', '')
-                if not target_col_id or target_col_type in unsupported_types:
-                    continue
-
-                formatted_value = format_column_value_for_update(source_col_value, source_col_type)
-                if not formatted_value:
-                    continue
-
-                updated = monday_api.update_column_value(
-                    target_subitem_board_id,
-                    target_subitem_id,
-                    target_col_id,
-                    formatted_value,
-                    target_col_type
-                )
-
-                if updated:
-                    _mark_update_made(target_subitem_id, target_col_id)
-                    subitems_result['column_values_synced'] += 1
-
-            # Ensure subitem updates are copied as well.
-            subitem_updates_result = monday_api.copy_missing_updates(
-                source_subitem_id,
-                target_subitem_id,
-                limit=200
-            )
-            subitems_result['updates_copied'] += subitem_updates_result.get('copied', 0)
-            subitems_result['update_copy_failed'] += subitem_updates_result.get('failed', 0)
-
-        logger.info(
-            "[transfer-to-sprint] Subitems sync result: "
-            f"{subitems_result}"
-        )
-
-        # Register the new item's status column in self-update cache so that the
-        # webhook triggered by the duplicate's creation is ignored.
-        _mark_update_made(new_item_id, column_id)
-
-        # ── Find the Sprint column on the board and update it ────────────────
+        # ── Find the Sprint column and update it on the item ─────────────────
         board_columns = monday_api.get_board_columns(board_id)
         sprint_col_id = None
         for col in board_columns:
-            col_title_lower = col.get('title', '').lower()
-            col_type = col.get('type', '')
-            if col_type == 'board_relation' and 'sprint' in col_title_lower:
+            if col.get('type') == 'board_relation' and 'sprint' in col.get('title', '').lower():
                 sprint_col_id = col['id']
                 break
 
-        sprint_updated = False
-        if sprint_col_id:
-            sprint_value = json.dumps({"item_ids": [int(latest_sprint['id'])]})
-            sprint_updated = monday_api.update_column_value(
-                board_id, new_item_id, sprint_col_id, sprint_value
-            )
-            if sprint_updated:
-                _mark_update_made(new_item_id, sprint_col_id)
-            logger.info(
-                f"[transfer-to-sprint] Sprint column '{sprint_col_id}' update on {new_item_id}: {sprint_updated}"
-            )
-        else:
-            logger.warning(
-                f"[transfer-to-sprint] No Sprint board_relation column found on board {board_id}"
-            )
+        if not sprint_col_id:
+            logger.warning(f"[transfer-to-sprint] No Sprint board_relation column found on board {board_id}")
+            return jsonify({'error': 'Sprint column not found on board', 'status': 'error'}), 404
 
-        # ── Get the source item name for the response ────────────────────────
-        source_item = monday_api.get_item_with_columns(item_id)
-        source_item_name = source_item.get('name', '') if source_item else ''
+        sprint_value = json.dumps({"item_ids": [int(latest_sprint['id'])]})
+        sprint_updated = monday_api.update_column_value(board_id, item_id, sprint_col_id, sprint_value)
+        if sprint_updated:
+            _mark_update_made(item_id, sprint_col_id)
+
+        logger.info(f"[transfer-to-sprint] Sprint column '{sprint_col_id}' update on {item_id}: {sprint_updated}")
 
         return jsonify({
             'status': 'success',
-            'message': (
-                f"Duplicated '{source_item_name}' to latest sprint '{latest_sprint['name']}'"
-            ),
-            'source_item': {
-                'id': item_id,
-                'name': source_item_name,
-                'board_id': board_id,
-                'board_name': source_board_name,
-                'status': status_label,
-            },
-            'duplicate_item': {
-                'id': new_item_id,
-                'sprint_id': latest_sprint['id'],
-                'sprint_name': latest_sprint['name'],
-                'sprint_column_updated': sprint_updated,
-            },
-            'copy_details': {
-                'item_updates': item_updates_result,
-                'subitems': subitems_result,
-            }
+            'message': f"Moved item {item_id} to sprint '{latest_sprint['name']}'",
+            'item_id': item_id,
+            'sprint_id': latest_sprint['id'],
+            'sprint_name': latest_sprint['name'],
+            'sprint_column_updated': sprint_updated,
         }), 200
 
     except Exception as e:
