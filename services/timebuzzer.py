@@ -2,10 +2,10 @@
 Sync Monday.com epics, backlog items, and subitems into timeBuzzer tiles.
 
 The CLI defaults to a dry run:
-  python timebuzzer.py
+  python -m services.timebuzzer
 
 Create missing tiles:
-  python timebuzzer.py --execute
+  python -m services.timebuzzer --execute
 
 Required environment variables:
   MONDAY_API_TOKEN
@@ -28,15 +28,15 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
+from config import Config
+from services.monday_api import MondayAPI
 
-MONDAY_API_URL = "https://api.monday.com/v2"
-TIMEBUZZER_BASE_URL = "https://my.timebuzzer.com/open-api"
-DEFAULT_WORKSPACE_ID = "5109455"
-DEFAULT_PAGE_LIMIT = 500
+TIMEBUZZER_BASE_URL = Config.TIMEBUZZER_BASE_URL
+DEFAULT_WORKSPACE_ID = Config.WORKSPACE_ID_2
 TIMEBUZZER_TILE_FIELDS = (
     "name",
     "children",
@@ -157,151 +157,6 @@ def compact_text(*parts: Any) -> str:
 def trim_name(value: Any, fallback: str) -> str:
     text = " ".join(str(value or "").split())
     return (text or fallback)[:255]
-
-
-class MondayClient:
-    def __init__(self, token: str, api_url: str = MONDAY_API_URL):
-        self.api_url = api_url
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "Authorization": token,
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            }
-        )
-
-    def execute(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        response = self.session.post(
-            self.api_url,
-            json={"query": query, "variables": variables or {}},
-            timeout=60,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("errors"):
-            raise RuntimeError(f"Monday GraphQL error: {payload['errors']}")
-        return payload.get("data") or {}
-
-    def list_boards(self, workspace_id: str) -> List[Dict[str, Any]]:
-        query = """
-        query ($workspace_ids: [ID!]) {
-            boards(limit: 500, workspace_ids: $workspace_ids) {
-                id
-                name
-                workspace {
-                    id
-                }
-            }
-        }
-        """
-        data = self.execute(query, {"workspace_ids": [int(workspace_id)]})
-        return [board for board in data.get("boards", []) if isinstance(board, dict)]
-
-    def find_board(self, workspace_id: str, names: Sequence[str]) -> Dict[str, Any]:
-        wanted = {normalize_name(name) for name in names}
-        boards = self.list_boards(workspace_id)
-        for board in boards:
-            if normalize_name(board.get("name")) in wanted:
-                return board
-        for board in boards:
-            board_name = normalize_name(board.get("name"))
-            if any(name in board_name for name in wanted):
-                return board
-        names_display = ", ".join(names)
-        raise RuntimeError(f"Could not find board named {names_display!r} in workspace {workspace_id}.")
-
-    def get_board_items(self, board_id: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        fields = """
-            id
-            name
-            state
-            created_at
-            updated_at
-            url
-            group {
-                id
-                title
-                color
-            }
-            column_values {
-                id
-                text
-                value
-                type
-                ... on BoardRelationValue {
-                    linked_item_ids
-                    display_value
-                }
-                ... on MirrorValue {
-                    display_value
-                }
-            }
-            subitems {
-                id
-                name
-                state
-                created_at
-                updated_at
-                url
-                column_values {
-                    id
-                    text
-                    value
-                    type
-                    ... on MirrorValue {
-                        display_value
-                    }
-                }
-            }
-        """
-        query = f"""
-        query ($board_id: [ID!], $limit: Int!) {{
-            boards(ids: $board_id) {{
-                id
-                name
-                description
-                columns {{
-                    id
-                    title
-                    type
-                }}
-                items_page(limit: $limit) {{
-                    cursor
-                    items {{
-                        {fields}
-                    }}
-                }}
-            }}
-        }}
-        """
-        data = self.execute(query, {"board_id": [int(board_id)], "limit": DEFAULT_PAGE_LIMIT})
-        boards = data.get("boards") or []
-        if not boards:
-            raise RuntimeError(f"Monday board {board_id} was not found.")
-
-        board = boards[0]
-        items_page = board.get("items_page") or {}
-        items = list(items_page.get("items") or [])
-        cursor = items_page.get("cursor")
-
-        while cursor:
-            page_query = f"""
-            query ($cursor: String!, $limit: Int!) {{
-                next_items_page(cursor: $cursor, limit: $limit) {{
-                    cursor
-                    items {{
-                        {fields}
-                    }}
-                }}
-            }}
-            """
-            page_data = self.execute(page_query, {"cursor": cursor, "limit": DEFAULT_PAGE_LIMIT})
-            page = page_data.get("next_items_page") or {}
-            items.extend(page.get("items") or [])
-            cursor = page.get("cursor")
-
-        return board, items
 
 
 class TimeBuzzerClient:
@@ -1010,14 +865,14 @@ def sync_monday_to_timebuzzer(
     Returns a summary dictionary. Set execute=True to call POST /tiles.
     """
     load_env_file()
-    monday_token = monday_token or os.environ.get("MONDAY_API_TOKEN")
-    timebuzzer_api_key = timebuzzer_api_key or os.environ.get("TIMEBUZZER_API_KEY")
+    monday_token = monday_token or Config.MONDAY_API_TOKEN
+    timebuzzer_api_key = timebuzzer_api_key or Config.TIMEBUZZER_API_KEY
     if not monday_token:
         raise RuntimeError("MONDAY_API_TOKEN is missing.")
     if not timebuzzer_api_key:
         raise RuntimeError("TIMEBUZZER_API_KEY is missing.")
 
-    monday = MondayClient(monday_token)
+    monday = MondayAPI(monday_token)
     timebuzzer = TimeBuzzerClient(timebuzzer_api_key, base_url=timebuzzer_base_url)
 
     existing_tiles = timebuzzer.get_all_tiles()
@@ -1267,10 +1122,10 @@ def find_epic_parent_ids(
 def parse_args() -> argparse.Namespace:
     load_env_file()
     parser = argparse.ArgumentParser(description="Sync Monday.com sprint backlog data into timeBuzzer tiles.")
-    parser.add_argument("--workspace-id", default=os.environ.get("WORKSPACE_ID_2", DEFAULT_WORKSPACE_ID))
+    parser.add_argument("--workspace-id", default=Config.WORKSPACE_ID_2 or DEFAULT_WORKSPACE_ID)
     parser.add_argument("--latest-sprints", type=int, default=2)
     parser.add_argument("--layer-ids", help="Comma-separated timeBuzzer layer IDs: epic,item,subitem.")
-    parser.add_argument("--base-url", default=TIMEBUZZER_BASE_URL)
+    parser.add_argument("--base-url", default=Config.TIMEBUZZER_BASE_URL or TIMEBUZZER_BASE_URL)
     parser.add_argument("--execute", action="store_true", help="Create missing timeBuzzer tiles. Defaults to dry run.")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()

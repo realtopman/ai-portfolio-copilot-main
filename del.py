@@ -19,6 +19,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import requests
 
+from config import Config
+
 
 DEFAULT_BASE_URL = "https://my.timebuzzer.com/open-api"
 
@@ -59,7 +61,7 @@ def normalize_authorization_header(value: Optional[str]) -> Optional[str]:
 class TimeBuzzerDeleteClient:
     def __init__(self, api_key: Optional[str] = None, base_url: str = DEFAULT_BASE_URL):
         load_env_file()
-        authorization = normalize_authorization_header(api_key or os.environ.get("TIMEBUZZER_API_KEY"))
+        authorization = normalize_authorization_header(api_key or Config.TIMEBUZZER_API_KEY)
         if not authorization:
             raise RuntimeError("TIMEBUZZER_API_KEY is missing. Add it to .env or the environment.")
 
@@ -128,14 +130,14 @@ def infer_layer_ids(tiles: List[Dict[str, Any]], explicit_layer_ids: Optional[st
     if parsed:
         return parsed
 
-    env_layer_ids = parse_layer_ids(os.environ.get("TIMEBUZZER_LAYER_IDS"))
+    env_layer_ids = parse_layer_ids(Config.TIMEBUZZER_LAYER_IDS)
     if env_layer_ids:
         return env_layer_ids
 
     env_named_layers = [
-        os.environ.get("TIMEBUZZER_EPIC_LAYER_ID"),
-        os.environ.get("TIMEBUZZER_ITEM_LAYER_ID"),
-        os.environ.get("TIMEBUZZER_SUBITEM_LAYER_ID"),
+        Config.TIMEBUZZER_EPIC_LAYER_ID,
+        Config.TIMEBUZZER_ITEM_LAYER_ID,
+        Config.TIMEBUZZER_SUBITEM_LAYER_ID,
     ]
     if all(env_named_layers):
         return [int(layer_id) for layer_id in env_named_layers if layer_id]

@@ -5,16 +5,23 @@ Monday.com API integration module for fetching and managing board data.
 import requests
 import json
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 import logging
 
 logger = logging.getLogger(__name__)
+
+MONDAY_API_URL = 'https://api.monday.com/v2'
+DEFAULT_PAGE_LIMIT = 500
+
+
+def _normalize_name(value: Any) -> str:
+    return " ".join(str(value or "").strip().lower().split())
 
 
 class MondayAPI:
     """Handles all interactions with Monday.com API."""
     
-    def __init__(self, api_token: str, api_url: str = 'https://api.monday.com/v2', workspace_ids: List[str] = None):
+    def __init__(self, api_token: str, api_url: str = MONDAY_API_URL, workspace_ids: List[str] = None):
         """
         Initialize Monday API client.
         
@@ -67,6 +74,148 @@ class MondayAPI:
         except Exception as e:
             logger.error(f"API Error: {str(e)}")
             raise
+
+    def list_boards(self, workspace_id: str) -> List[Dict[str, Any]]:
+        """
+        List boards in a workspace.
+
+        This is used by the TimeBuzzer sync to resolve board names without
+        duplicating Monday GraphQL client logic.
+        """
+        query = """
+        query ($workspace_ids: [ID!]) {
+            boards(limit: 500, workspace_ids: $workspace_ids) {
+                id
+                name
+                workspace {
+                    id
+                }
+            }
+        }
+        """
+        data = self._execute_query(query, {"workspace_ids": [int(workspace_id)]})
+        return [board for board in data.get("boards", []) if isinstance(board, dict)]
+
+    def find_board(self, workspace_id: str, names: Sequence[str]) -> Dict[str, Any]:
+        """
+        Find a board by exact normalized name first, then partial normalized name.
+
+        Raises RuntimeError when no matching board is found, matching the
+        previous TimeBuzzer MondayClient behavior.
+        """
+        wanted = {_normalize_name(name) for name in names}
+        boards = self.list_boards(workspace_id)
+        for board in boards:
+            if _normalize_name(board.get("name")) in wanted:
+                return board
+        for board in boards:
+            board_name = _normalize_name(board.get("name"))
+            if any(name in board_name for name in wanted):
+                return board
+        names_display = ", ".join(names)
+        raise RuntimeError(f"Could not find board named {names_display!r} in workspace {workspace_id}.")
+
+    def get_board_items(
+        self,
+        board_id: str,
+        limit: int = DEFAULT_PAGE_LIMIT,
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """
+        Fetch board metadata and all items, including Monday pagination.
+
+        This returns the shape expected by TimeBuzzer sync:
+        (board, items), where board includes columns and items include subitems.
+        """
+        fields = """
+            id
+            name
+            state
+            created_at
+            updated_at
+            url
+            group {
+                id
+                title
+                color
+            }
+            column_values {
+                id
+                text
+                value
+                type
+                ... on BoardRelationValue {
+                    linked_item_ids
+                    display_value
+                }
+                ... on MirrorValue {
+                    display_value
+                }
+            }
+            subitems {
+                id
+                name
+                state
+                created_at
+                updated_at
+                url
+                column_values {
+                    id
+                    text
+                    value
+                    type
+                    ... on MirrorValue {
+                        display_value
+                    }
+                }
+            }
+        """
+        query = f"""
+        query ($board_id: [ID!], $limit: Int!) {{
+            boards(ids: $board_id) {{
+                id
+                name
+                description
+                columns {{
+                    id
+                    title
+                    type
+                }}
+                items_page(limit: $limit) {{
+                    cursor
+                    items {{
+                        {fields}
+                    }}
+                }}
+            }}
+        }}
+        """
+        data = self._execute_query(query, {"board_id": [int(board_id)], "limit": int(limit)})
+        boards = data.get("boards") or []
+        if not boards:
+            raise RuntimeError(f"Monday board {board_id} was not found.")
+
+        board = boards[0]
+        items_page = board.get("items_page") or {}
+        items = list(items_page.get("items") or [])
+        cursor = items_page.get("cursor")
+
+        while cursor:
+            page_query = f"""
+            query ($cursor: String!, $limit: Int!) {{
+                next_items_page(cursor: $cursor, limit: $limit) {{
+                    cursor
+                    items {{
+                        {fields}
+                    }}
+                }}
+            }}
+            """
+            page_data = self._execute_query(page_query, {"cursor": cursor, "limit": int(limit)})
+            page = page_data.get("next_items_page") or {}
+            items.extend(page.get("items") or [])
+            cursor = page.get("cursor")
+
+        return board, items
     
     def get_folder_id_by_name(self, workspace_id: str, folder_name: str) -> Optional[str]:
         """
@@ -2392,7 +2541,7 @@ class MondayAPI:
         Returns:
             List of matching board dicts
         """
-        from helper import BOARD_PATTERNS
+        from utils.helper import BOARD_PATTERNS
         
         query = """
         query ($workspace_ids: [ID!]) {

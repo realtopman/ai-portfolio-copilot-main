@@ -1,5 +1,8 @@
 import os
 from datetime import timedelta
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class Config:
     """Base configuration"""
@@ -18,6 +21,15 @@ class Config:
     # OpenAI Configuration
     OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
     OPENAI_MODEL = os.environ.get('OPENAI_MODEL', 'gpt-3.5-turbo')
+
+    # TimeBuzzer Configuration
+    TIMEBUZZER_API_KEY = os.environ.get('TIMEBUZZER_API_KEY')
+    TIMEBUZZER_BASE_URL = os.environ.get('TIMEBUZZER_BASE_URL', 'https://my.timebuzzer.com/open-api')
+    TIMEBUZZER_LAYER_IDS = os.environ.get('TIMEBUZZER_LAYER_IDS')
+    TIMEBUZZER_EPIC_LAYER_ID = os.environ.get('TIMEBUZZER_EPIC_LAYER_ID')
+    TIMEBUZZER_ITEM_LAYER_ID = os.environ.get('TIMEBUZZER_ITEM_LAYER_ID')
+    TIMEBUZZER_SUBITEM_LAYER_ID = os.environ.get('TIMEBUZZER_SUBITEM_LAYER_ID')
+    TIMEBUZZER_ACTIVITY_CACHE_FILE = os.environ.get('TIMEBUZZER_ACTIVITY_CACHE_FILE')
 
 class DevelopmentConfig(Config):
     """Development configuration"""
